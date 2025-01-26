@@ -3,6 +3,7 @@ import re
 import csv
 import os
 import logging
+import requests  # Added import for fetching thumbnails
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -95,6 +96,7 @@ class ScrapeWorker(QThread):
         super().__init__()
         self.channels = channels
         self.headless = headless
+        self._is_running = True  # Flag to control thread execution
 
     def run(self):
         logger.info("Starting scraping with yt-dlp...")
@@ -103,6 +105,10 @@ class ScrapeWorker(QThread):
         logger.info(f"Total channels to scrape: {total_channels}")
 
         for idx, channel_url in enumerate(self.channels):
+            if not self._is_running:
+                logger.info("Scraping canceled by user.")
+                break
+
             self.progressUpdated.emit(idx + 1, total_channels)
             logger.info(f"Scraping channel {idx + 1}/{total_channels}: {channel_url}")
 
@@ -126,6 +132,10 @@ class ScrapeWorker(QThread):
                 continue
 
             for entry in info['entries']:
+                if not self._is_running:
+                    logger.info("Scraping canceled by user.")
+                    break
+
                 if entry is None:
                     continue  # Skip if entry extraction failed
 
@@ -134,7 +144,12 @@ class ScrapeWorker(QThread):
 
                 # Filter for Shorts based on URL containing '/shorts/'
                 if '/shorts/' in video_url:
-                    full_url = f"{video_url}"
+                    video_id = self.get_video_id(video_url)
+                    if not video_id:
+                        logger.warning(f"Could not extract video ID from URL: {video_url}")
+                        continue
+
+                    full_url = f"https://www.youtube.com/watch?v={video_id}"
                     video_data = {
                         'title': title,
                         'url': full_url,
@@ -150,11 +165,26 @@ class ScrapeWorker(QThread):
         """
         Constructs the thumbnail URL based on the video ID extracted from the URL.
         """
-        match = re.search(r"/shorts/([^?/]+)", video_url)
-        if match:
-            video_id = match.group(1)
+        video_id = self.get_video_id(video_url)
+        if video_id:
             return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
         return ""
+
+    def get_video_id(self, video_url):
+        """
+        Extracts the video ID from the full video URL.
+        """
+        match = re.search(r"v=([^&?/]+)", video_url)
+        if match:
+            return match.group(1)
+        match = re.search(r"/shorts/([^?/]+)", video_url)
+        if match:
+            return match.group(1)
+        return ""
+
+    def stop(self):
+        """Stops the thread execution."""
+        self._is_running = False
 
 # --------------------------------------------------------------------------
 # DOWNLOAD WORKER (YT-DLP)
@@ -176,6 +206,7 @@ class DownloadWorker(QThread):
         self.videos_data = videos_data
         self.download_folder = download_folder
         self.table_widget = table_widget
+        self._is_running = True  # Flag to control thread execution
 
     def run(self):
         total = len(self.videos_data)
@@ -202,6 +233,10 @@ class DownloadWorker(QThread):
 
         with YoutubeDL(ydl_opts) as ydl:
             for i, item in enumerate(self.videos_data):
+                if not self._is_running:
+                    logger.info("Download canceled by user.")
+                    break
+
                 url = item['url']
                 row = i
                 self.update_status(row, "downloading")
@@ -230,13 +265,51 @@ class DownloadWorker(QThread):
         status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table_widget.setItem(row, 3, status_item)
 
+    def stop(self):
+        """Stops the thread execution."""
+        self._is_running = False
+
+# --------------------------------------------------------------------------
+# THUMBNAIL LOADER THREAD
+# --------------------------------------------------------------------------
+class ThumbnailLoader(QThread):
+    """
+    Loads thumbnail images in a separate thread to prevent blocking the UI.
+    """
+    thumbnailLoaded = pyqtSignal(int, QPixmap)
+
+    def __init__(self, row, thumb_url):
+        super().__init__()
+        self.row = row
+        self.thumb_url = thumb_url
+
+    def run(self):
+        pixmap = None
+        try:
+            resp = requests.get(self.thumb_url, timeout=10)
+            if resp.status_code == 200:
+                img_data = resp.content
+                pixmap = QPixmap()
+                if pixmap.loadFromData(img_data):
+                    logger.debug(f"Thumbnail loaded for row {self.row}.")
+                else:
+                    logger.warning(f"Failed to load pixmap from data: {self.thumb_url}")
+            else:
+                logger.warning(
+                    f"Thumbnail request failed (status={resp.status_code}): {self.thumb_url}"
+                )
+        except Exception as e:
+            logger.warning(f"Could not load thumbnail: {self.thumb_url}. Error: {e}")
+
+        self.thumbnailLoaded.emit(self.row, pixmap)
+
 # --------------------------------------------------------------------------
 # MAIN WINDOW
 # --------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sniperz - Youtube Shorts Bulk Downloader")
+        self.setWindowTitle("Sniperz - YouTube Shorts Bulk Downloader")
         self.setWindowIcon(QIcon("sniperz_icon.png"))  # Ensure 'sniperz_icon.png' is in the script directory
 
         # Central widget + layout
@@ -261,7 +334,7 @@ class MainWindow(QMainWindow):
         menubar.addMenu(channel_menu)
         self.setMenuBar(menubar)
 
-        # Top row (1): channel selection + scrape
+        # Top row (1): channel selection + scrape + cancel scrape
         top_layout = QHBoxLayout()
         label = QLabel("Select channel:")
         self.channel_combo = QComboBox()
@@ -286,10 +359,28 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        # top_layout => channel label, combo, Scrape
+        self.cancel_scrape_button = QPushButton("Cancel Scrape")
+        self.cancel_scrape_button.clicked.connect(self.cancel_scrape)
+        self.cancel_scrape_button.setFixedHeight(40)  # Increased height
+        self.cancel_scrape_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                border-radius: 5px;
+                font-size: 16px;
+                padding: 10px;
+            }
+            QPushButton:disabled {
+                background-color: #EF9A9A;
+            }
+        """)
+        self.cancel_scrape_button.setEnabled(False)  # Initially disabled
+
+        # top_layout => channel label, combo, Scrape, Cancel Scrape
         top_layout.addWidget(label)
         top_layout.addWidget(self.channel_combo)
         top_layout.addWidget(self.scrape_button)
+        top_layout.addWidget(self.cancel_scrape_button)
 
         # Top row (2): download folder + browse button
         folder_layout = QHBoxLayout()
@@ -317,7 +408,7 @@ class MainWindow(QMainWindow):
         folder_layout.addWidget(self.folder_edit)
         folder_layout.addWidget(self.browse_button)
 
-        # Row for Export CSV & Download Videos
+        # Row for Export CSV, Download Videos, Cancel Download
         action_layout = QHBoxLayout()
         self.export_button = QPushButton("Export CSV")
         self.export_button.clicked.connect(self.export_csv)
@@ -353,14 +444,37 @@ class MainWindow(QMainWindow):
             }
         """)
 
+        self.cancel_download_button = QPushButton("Cancel Download")
+        self.cancel_download_button.clicked.connect(self.cancel_download)
+        self.cancel_download_button.setFixedHeight(40)  # Increased height
+        self.cancel_download_button.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                border-radius: 5px;
+                font-size: 16px;
+                padding: 10px;
+            }
+            QPushButton:disabled {
+                background-color: #CE93D8;
+            }
+        """)
+        self.cancel_download_button.setEnabled(False)  # Initially disabled
+
         action_layout.addWidget(self.export_button)
         action_layout.addWidget(self.download_button)
+        action_layout.addWidget(self.cancel_download_button)
 
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFixedHeight(25)  # Slightly increased height
+
+        # Total Videos Label
+        self.total_videos_label = QLabel("Total Videos: 0")
+        self.total_videos_label.setStyleSheet("font-size: 14px;")
+        self.total_videos_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
         # Table for results
         self.results_table = QTableWidget()
@@ -399,6 +513,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(folder_layout)
         main_layout.addLayout(action_layout)
         main_layout.addWidget(self.progress_bar)
+        main_layout.addWidget(self.total_videos_label)
         main_layout.addWidget(self.results_table)
         main_layout.addWidget(QLabel("Log Output:"))
         main_layout.addWidget(self.log_box)
@@ -425,10 +540,30 @@ class MainWindow(QMainWindow):
         # Thread references
         self.scrape_worker = None
         self.download_worker = None
+        self.thumbnail_loaders = []  # List to keep track of ThumbnailLoader threads
 
         # Store scraped data
         self.scraped_data = []
         self.current_row = 0  # To keep track of table rows
+
+        # Load placeholder image
+        self.load_placeholder()
+
+    def load_placeholder(self):
+        """Load a placeholder image to use when thumbnail fails to load."""
+        placeholder_path = "placeholder.png"
+        if os.path.exists(placeholder_path):
+            self.placeholder_pixmap = QPixmap(placeholder_path).scaled(
+                80, 60,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            logger.debug("Loaded placeholder image.")
+        else:
+            # Create a simple placeholder pixmap if the file doesn't exist
+            self.placeholder_pixmap = QPixmap(80, 60)
+            self.placeholder_pixmap.fill(Qt.GlobalColor.gray)
+            logger.warning("Placeholder image not found. Using a gray rectangle as placeholder.")
 
     # ---------------------------------------------------------
     # BROWSE FOLDER
@@ -490,6 +625,7 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False)
         self.browse_button.setEnabled(False)
         self.channel_combo.setEnabled(False)
+        self.cancel_scrape_button.setEnabled(True)  # Enable Cancel Scrape button
 
         # Change button text to indicate scraping
         self.scrape_button.setText("Scraping...")
@@ -497,6 +633,7 @@ class MainWindow(QMainWindow):
         # Clear table & reset
         self.results_table.setRowCount(0)
         self.progress_bar.setValue(0)
+        self.total_videos_label.setText("Total Videos: 0")
         self.scraped_data = []
         self.current_row = 0
 
@@ -522,7 +659,21 @@ class MainWindow(QMainWindow):
         self.browse_button.setEnabled(True)
         self.channel_combo.setEnabled(True)
         self.scrape_button.setText("Scrape")
+        self.cancel_scrape_button.setEnabled(False)  # Disable Cancel Scrape button
         logger.info("Ready for next operation.")
+
+    # ---------------------------------------------------------
+    # CANCEL SCRAPE
+    # ---------------------------------------------------------
+    def cancel_scrape(self):
+        """Cancel the ongoing scrape operation."""
+        if self.scrape_worker and self.scrape_worker.isRunning():
+            logger.info("User requested to cancel scraping.")
+            self.scrape_worker.stop()
+            self.cancel_scrape_button.setEnabled(False)
+            self.scrape_button.setText("Canceling...")
+        else:
+            logger.warning("No active scrape operation to cancel.")
 
     # ---------------------------------------------------------
     # ADD VIDEO TO TABLE
@@ -540,25 +691,10 @@ class MainWindow(QMainWindow):
         thumb_item = QTableWidgetItem()
         thumb_item.setText("")
         thumb_item.setFlags(thumb_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        thumb_item.setData(Qt.ItemDataRole.DecorationRole, self.placeholder_pixmap)  # Set placeholder initially
 
-        try:
-            resp = requests.get(thumb_url, timeout=5)
-            if resp.status_code == 200:
-                img_data = resp.content
-                pixmap = QPixmap()
-                pixmap.loadFromData(img_data)
-                pixmap = pixmap.scaled(
-                    80, 60,  # Smaller thumbnail size
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                thumb_item.setData(Qt.ItemDataRole.DecorationRole, pixmap)
-            else:
-                logger.warning(
-                    f"Thumbnail request failed (status={resp.status_code}): {thumb_url}"
-                )
-        except Exception as e:
-            logger.warning(f"Could not load thumbnail: {thumb_url}. Error: {e}")
+        # Asynchronously load the thumbnail to avoid blocking the UI
+        self.load_thumbnail_async(row, thumb_url)
 
         # Title
         title_item = QTableWidgetItem(title)
@@ -584,10 +720,48 @@ class MainWindow(QMainWindow):
         self.current_row += 1
         logger.debug(f"Added video to table: {title}")
 
+        # Update total videos count
+        self.total_videos_label.setText(f"Total Videos: {len(self.scraped_data)}")
+
         # Enable download and export buttons if data exists
         if len(self.scraped_data) > 0:
             self.download_button.setEnabled(True)
             self.export_button.setEnabled(True)
+
+    def load_thumbnail_async(self, row, thumb_url):
+        """
+        Loads thumbnail image asynchronously to prevent UI blocking.
+        Updates the table item once the image is loaded.
+        """
+        thread = ThumbnailLoader(row, thumb_url)
+        thread.thumbnailLoaded.connect(self.update_thumbnail)
+        thread.finished.connect(lambda: self.remove_thumbnail_loader(thread))
+        self.thumbnail_loaders.append(thread)
+        thread.start()
+
+    def update_thumbnail(self, row, pixmap):
+        """
+        Updates the thumbnail in the table once it's loaded.
+        """
+        if pixmap is not None:
+            scaled_pixmap = pixmap.scaled(
+                80, 60,  # Smaller thumbnail size
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.results_table.item(row, 0).setData(Qt.ItemDataRole.DecorationRole, scaled_pixmap)
+            logger.debug(f"Thumbnail updated for row {row}.")
+        else:
+            # If pixmap is None, keep the placeholder
+            logger.debug(f"Using placeholder for row {row} due to thumbnail load failure.")
+
+    def remove_thumbnail_loader(self, thread):
+        """
+        Removes the finished ThumbnailLoader thread from the list to prevent memory leaks.
+        """
+        if thread in self.thumbnail_loaders:
+            self.thumbnail_loaders.remove(thread)
+            logger.debug(f"ThumbnailLoader thread for row {thread.row} removed.")
 
     # ---------------------------------------------------------
     # PROGRESS UPDATES (SCRAPE OR DOWNLOAD)
@@ -648,6 +822,7 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False)
         self.browse_button.setEnabled(False)
         self.channel_combo.setEnabled(False)
+        self.cancel_download_button.setEnabled(True)  # Enable Cancel Download button
 
         # Change button text to indicate downloading
         self.download_button.setText("Downloading...")
@@ -669,7 +844,49 @@ class MainWindow(QMainWindow):
         self.browse_button.setEnabled(True)
         self.channel_combo.setEnabled(True)
         self.download_button.setText("Download Videos")
+        self.cancel_download_button.setEnabled(False)  # Disable Cancel Download button
         logger.info("Ready for next operation.")
+
+    # ---------------------------------------------------------
+    # CANCEL DOWNLOAD
+    # ---------------------------------------------------------
+    def cancel_download(self):
+        """Cancel the ongoing download operation."""
+        if self.download_worker and self.download_worker.isRunning():
+            logger.info("User requested to cancel downloading.")
+            self.download_worker.stop()
+            self.cancel_download_button.setEnabled(False)
+            self.download_button.setText("Canceling...")
+        else:
+            logger.warning("No active download operation to cancel.")
+
+    # ---------------------------------------------------------
+    # CLOSE EVENT HANDLER
+    # ---------------------------------------------------------
+    def closeEvent(self, event):
+        """Handle the window close event to ensure all threads are properly terminated."""
+        logger.info("Closing application. Waiting for all threads to finish...")
+
+        # Terminate ScrapeWorker if it's running
+        if self.scrape_worker and self.scrape_worker.isRunning():
+            logger.info("Waiting for ScrapeWorker to finish...")
+            self.scrape_worker.stop()
+            self.scrape_worker.wait()
+
+        # Terminate DownloadWorker if it's running
+        if self.download_worker and self.download_worker.isRunning():
+            logger.info("Waiting for DownloadWorker to finish...")
+            self.download_worker.stop()
+            self.download_worker.wait()
+
+        # Terminate all ThumbnailLoader threads
+        for thread in self.thumbnail_loaders:
+            if thread.isRunning():
+                logger.info(f"Waiting for ThumbnailLoader thread for row {thread.row} to finish...")
+                thread.wait()
+
+        logger.info("All threads have been terminated. Application will close now.")
+        event.accept()
 
 # --------------------------------------------------------------------------
 # MAIN
@@ -678,7 +895,7 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    logger.info("Sniperz - Youtube Shorts Bulk Downloader GUI is now visible. Ready to scrape or download.")
+    logger.info("Sniperz - YouTube Shorts Bulk Downloader GUI is now visible. Ready to scrape or download.")
     sys.exit(app.exec())
 
 if __name__ == "__main__":
