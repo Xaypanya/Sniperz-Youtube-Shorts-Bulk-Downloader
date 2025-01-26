@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit
 )
 from PyQt6.QtGui import QAction, QIcon, QPixmap
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QRunnable, QThreadPool  # Added QThreadPool
 
 # For Downloading via yt-dlp
 try:
@@ -61,183 +61,90 @@ logger = logging.getLogger("SniperzDownloader")
 logger.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs
 
 # --------------------------------------------------------------------------
-# SCRAPE WORKER (YT-DLP)
+# DOWNLOAD RUNNABLE (YT-DLP)
 # --------------------------------------------------------------------------
-class ScrapeWorker(QThread):
-    """
-    Runs the scraping task in a separate thread using yt-dlp.
-    Emits signals for progress and individual video results.
-    """
-    videoScraped = pyqtSignal(dict)          # Emits individual video data
-    progressUpdated = pyqtSignal(int, int)   # (current_index, total)
-    done = pyqtSignal()                      # Signals when all scraping is done
+class DownloadSignals(QObject):
+    """Defines the signals available from a running download task."""
+    progress = pyqtSignal(int, int)  # (current_index, total)
+    finished = pyqtSignal(int, str)  # (row, status)
+    error = pyqtSignal(int, str)     # (row, error_message)
 
-    def __init__(self, channels, headless=True):
+class DownloadRunnable(QRunnable):
+    """
+    A QRunnable task that downloads a single video using yt-dlp.
+    """
+    def __init__(self, row, video_data, download_folder):
         super().__init__()
-        self.channels = channels
-        self.headless = headless
-        self._is_running = True  # Flag to control thread execution
+        self.row = row
+        self.video_data = video_data
+        self.download_folder = download_folder
+        self.signals = DownloadSignals()
 
     def run(self):
-        logger.info("Starting scraping with yt-dlp...")
-
-        total_channels = len(self.channels)
-        logger.info(f"Total channels to scrape: {total_channels}")
-
-        for idx, channel_url in enumerate(self.channels):
-            if not self._is_running:
-                logger.info("Scraping canceled by user.")
-                break
-
-            self.progressUpdated.emit(idx + 1, total_channels)
-            logger.info(f"Scraping channel {idx + 1}/{total_channels}: {channel_url}")
-
-            # Extract video entries using yt-dlp
-            try:
-                ydl_opts = {
-                    'quiet': True,
-                    'extract_flat': True,
-                    'skip_download': True,
-                    'ignoreerrors': True,
-                }
-                with YoutubeDL(ydl_opts) as ydl:
-                    logger.debug(f"Extracting videos from: {channel_url}")
-                    info = ydl.extract_info(channel_url, download=False)
-            except Exception as e:
-                logger.error(f"Error extracting info from {channel_url}: {e}")
-                continue  # Proceed to next channel
-
-            if 'entries' not in info:
-                logger.error(f"No entries found for channel: {channel_url}")
-                continue
-
-            for entry in info['entries']:
-                if not self._is_running:
-                    logger.info("Scraping canceled by user.")
-                    break
-
-                if entry is None:
-                    continue  # Skip if entry extraction failed
-
-                video_url = entry.get('url', '')
-                title = entry.get('title', 'No Title')
-
-                # Filter for Shorts based on URL containing '/shorts/'
-                if '/shorts/' in video_url:
-                    video_id = self.get_video_id(video_url)
-                    if not video_id:
-                        logger.warning(f"Could not extract video ID from URL: {video_url}")
-                        continue
-
-                    full_url = f"https://www.youtube.com/watch?v={video_id}"
-                    video_data = {
-                        'title': title,
-                        'url': full_url,
-                        'thumbnail_url': self.get_thumbnail_url(full_url)
-                    }
-                    self.videoScraped.emit(video_data)
-                    logger.debug(f"Scraped Shorts video: {title} - {full_url}")
-
-        logger.info("Finished scraping all channels.")
-        self.done.emit()
-
-    def get_thumbnail_url(self, video_url):
-        """
-        Constructs the thumbnail URL based on the video ID extracted from the URL.
-        """
-        video_id = self.get_video_id(video_url)
-        if video_id:
-            return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-        return ""
-
-    def get_video_id(self, video_url):
-        """
-        Extracts the video ID from the full video URL.
-        """
-        match = re.search(r"v=([^&?/]+)", video_url)
-        if match:
-            return match.group(1)
-        match = re.search(r"/shorts/([^?/]+)", video_url)
-        if match:
-            return match.group(1)
-        return ""
-
-    def stop(self):
-        """Stops the thread execution."""
-        self._is_running = False
+        url = self.video_data['url']
+        title = self.video_data['title']
+        try:
+            ydl_opts = {
+                "format": "mp4/best",
+                "outtmpl": os.path.join(self.download_folder, f"{title}.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "ignoreerrors": True,
+                "retries": 3,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            self.signals.finished.emit(self.row, "finished")
+        except Exception as e:
+            self.signals.error.emit(self.row, str(e))
 
 # --------------------------------------------------------------------------
-# DOWNLOAD WORKER (YT-DLP)
+# DOWNLOAD WORKER (MANAGES THREAD POOL)
 # --------------------------------------------------------------------------
-class DownloadWorker(QThread):
+class DownloadWorker(QObject):
     """
-    Downloads each Short video in a separate thread using yt-dlp.
+    Manages the downloading of videos using a QThreadPool with limited concurrency.
     """
-    progressUpdated = pyqtSignal(int, int)  # (current_index, total)
+    progressUpdated = pyqtSignal(int, int)   # (current_downloaded, total)
     done = pyqtSignal()                      # Signals when all downloads are done
 
     def __init__(self, videos_data, download_folder, table_widget):
-        """
-        videos_data: list of dict { 'title': ..., 'url': ..., 'thumbnail_url': ... }
-        download_folder: str (folder path where files should be saved)
-        table_widget: QTableWidget instance to update status
-        """
         super().__init__()
         self.videos_data = videos_data
         self.download_folder = download_folder
         self.table_widget = table_widget
-        self._is_running = True  # Flag to control thread execution
+        self.thread_pool = QThreadPool.globalInstance()
+        self.thread_pool.setMaxThreadCount(5)  # Limit to 5 concurrent downloads
+        self.total = len(videos_data)
+        self.downloaded = 0
+        self.failed = 0
+        self.active_downloads = 0
 
-    def run(self):
-        total = len(self.videos_data)
-        logger.info(f"Starting download of {total} videos to: {self.download_folder}")
+    def start_downloads(self):
+        for row, video_data in enumerate(self.videos_data):
+            self.active_downloads += 1
+            runnable = DownloadRunnable(row, video_data, self.download_folder)
+            runnable.signals.finished.connect(self.on_download_finished)
+            runnable.signals.error.connect(self.on_download_error)
+            self.thread_pool.start(runnable)
 
-        if not os.path.exists(self.download_folder):
-            try:
-                os.makedirs(self.download_folder)
-                logger.debug(f"Created download folder: {self.download_folder}")
-            except Exception as e:
-                logger.error(f"Could not create folder: {self.download_folder}. Error: {e}")
-                self.done.emit()
-                return
+    def on_download_finished(self, row, status):
+        self.update_status(row, status)
+        self.downloaded += 1
+        self.active_downloads -= 1
+        self.progressUpdated.emit(self.downloaded + self.failed, self.total)
+        self.check_completion()
 
-        # Setup yt-dlp options
-        ydl_opts = {
-            "format": "mp4/best",
-            "outtmpl": os.path.join(self.download_folder, "%(title)s.%(ext)s"),
-            "quiet": True,       # We'll handle logging manually
-            "no_warnings": True,
-            "ignoreerrors": True,  # Continue on download errors
-            "retries": 3,          # Retry failed downloads
-        }
-
-        with YoutubeDL(ydl_opts) as ydl:
-            for i, item in enumerate(self.videos_data):
-                if not self._is_running:
-                    logger.info("Download canceled by user.")
-                    break
-
-                url = item['url']
-                row = i
-                self.update_status(row, "downloading")
-                logger.info(f"Downloading {i + 1}/{total}: {url}")
-                try:
-                    ydl.download([url])
-                    self.update_status(row, "finished")
-                    logger.debug(f"Downloaded video: {item['title']}")
-                except Exception as e:
-                    logger.error(f"Failed to download {url}. Error: {e}")
-                    self.update_status(row, "error")
-
-                self.progressUpdated.emit(i + 1, total)
-
-        logger.info("All downloads complete.")
-        self.done.emit()
+    def on_download_error(self, row, error_message):
+        self.update_status(row, "error")
+        logger.error(f"Failed to download row {row}: {error_message}")
+        self.failed += 1
+        self.active_downloads -= 1
+        self.progressUpdated.emit(self.downloaded + self.failed, self.total)
+        self.check_completion()
 
     def update_status(self, row, status):
         emoji = {
-            "not_started": "⏳",
-            "downloading": "⬇️",
             "finished": "✅",
             "error": "❌",
         }.get(status, "⏳")
@@ -245,9 +152,10 @@ class DownloadWorker(QThread):
         status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table_widget.setItem(row, 3, status_item)
 
-    def stop(self):
-        """Stops the thread execution."""
-        self._is_running = False
+    def check_completion(self):
+        if self.downloaded + self.failed >= self.total:
+            logger.info("All downloads have been processed.")
+            self.done.emit()
 
 # --------------------------------------------------------------------------
 # THUMBNAIL LOADER THREAD
@@ -285,6 +193,7 @@ class ThumbnailLoader(QThread):
             logger.debug(f"Emitting default pixmap for row {self.row}.")
 
         self.thumbnailLoaded.emit(self.row, pixmap)
+
 # --------------------------------------------------------------------------
 # MAIN WINDOW
 # --------------------------------------------------------------------------
@@ -519,7 +428,7 @@ class MainWindow(QMainWindow):
 
         # Thread references
         self.scrape_worker = None
-        self.download_worker = None
+        self.download_worker_obj = None  # Reference to DownloadWorker
         self.thumbnail_loaders = []  # List to keep track of ThumbnailLoader threads
 
         # Store scraped data
@@ -802,7 +711,7 @@ class MainWindow(QMainWindow):
                 logger.error(f"Failed to write CSV: {e}")
 
     # ---------------------------------------------------------
-    # DOWNLOAD VIDEOS (YT-DLP)
+    # DOWNLOAD VIDEOS (YT-DLP) with 5 Parallel Threads
     # ---------------------------------------------------------
     def handle_download_videos(self):
         """Download the scraped Shorts to the folder specified in self.folder_edit."""
@@ -828,10 +737,13 @@ class MainWindow(QMainWindow):
         # Change button text to indicate downloading
         self.download_button.setText("Downloading...")
 
-        self.download_worker = DownloadWorker(self.scraped_data, download_folder, self.results_table)
-        self.download_worker.progressUpdated.connect(self.update_progress)
-        self.download_worker.done.connect(self.download_finished)
-        self.download_worker.start()
+        # Initialize DownloadWorker
+        self.download_worker_obj = DownloadWorker(self.scraped_data, download_folder, self.results_table)
+        self.download_worker_obj.progressUpdated.connect(self.update_progress)
+        self.download_worker_obj.done.connect(self.download_finished)
+
+        # Start downloads
+        self.download_worker_obj.start_downloads()
 
     def download_finished(self):
         """Handle actions after downloading is complete."""
@@ -852,11 +764,13 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------
     def cancel_download(self):
         """Cancel the ongoing download operation."""
-        if self.download_worker and self.download_worker.isRunning():
+        if self.download_worker_obj:
             logger.info("User requested to cancel downloading.")
-            self.download_worker.stop()
+            self.thread_pool.clear()  # Clears all pending tasks
+            self.download_worker_obj = None
             self.cancel_download_button.setEnabled(False)
-            self.download_button.setText("Canceling...")
+            self.download_button.setText("Download Videos")
+            logger.info("Download operation canceled.")
         else:
             logger.warning("No active download operation to cancel.")
 
@@ -867,17 +781,14 @@ class MainWindow(QMainWindow):
         """Handle the window close event to ensure all threads are properly terminated."""
         logger.info("Closing application. Waiting for all threads to finish...")
 
+        # Clear the thread pool to stop all running tasks
+        self.thread_pool.clear()
+
         # Terminate ScrapeWorker if it's running
         if self.scrape_worker and self.scrape_worker.isRunning():
             logger.info("Waiting for ScrapeWorker to finish...")
             self.scrape_worker.stop()
             self.scrape_worker.wait()
-
-        # Terminate DownloadWorker if it's running
-        if self.download_worker and self.download_worker.isRunning():
-            logger.info("Waiting for DownloadWorker to finish...")
-            self.download_worker.stop()
-            self.download_worker.wait()
 
         # Terminate all ThumbnailLoader threads
         for thread in self.thumbnail_loaders:
@@ -887,6 +798,112 @@ class MainWindow(QMainWindow):
 
         logger.info("All threads have been terminated. Application will close now.")
         event.accept()
+
+# --------------------------------------------------------------------------
+# SCRAPE WORKER (YT-DLP)
+# --------------------------------------------------------------------------
+class ScrapeWorker(QThread):
+    """
+    Runs the scraping task in a separate thread using yt-dlp.
+    Emits signals for progress and individual video results.
+    """
+    videoScraped = pyqtSignal(dict)          # Emits individual video data
+    progressUpdated = pyqtSignal(int, int)   # (current_index, total)
+    done = pyqtSignal()                      # Signals when all scraping is done
+
+    def __init__(self, channels, headless=True):
+        super().__init__()
+        self.channels = channels
+        self.headless = headless
+        self._is_running = True  # Flag to control thread execution
+
+    def run(self):
+        logger.info("Starting scraping with yt-dlp...")
+
+        total_channels = len(self.channels)
+        logger.info(f"Total channels to scrape: {total_channels}")
+
+        for idx, channel_url in enumerate(self.channels):
+            if not self._is_running:
+                logger.info("Scraping canceled by user.")
+                break
+
+            self.progressUpdated.emit(idx + 1, total_channels)
+            logger.info(f"Scraping channel {idx + 1}/{total_channels}: {channel_url}")
+
+            # Extract video entries using yt-dlp
+            try:
+                ydl_opts = {
+                    'quiet': True,
+                    'extract_flat': True,
+                    'skip_download': True,
+                    'ignoreerrors': True,
+                }
+                with YoutubeDL(ydl_opts) as ydl:
+                    logger.debug(f"Extracting videos from: {channel_url}")
+                    info = ydl.extract_info(channel_url, download=False)
+            except Exception as e:
+                logger.error(f"Error extracting info from {channel_url}: {e}")
+                continue  # Proceed to next channel
+
+            if 'entries' not in info:
+                logger.error(f"No entries found for channel: {channel_url}")
+                continue
+
+            for entry in info['entries']:
+                if not self._is_running:
+                    logger.info("Scraping canceled by user.")
+                    break
+
+                if entry is None:
+                    continue  # Skip if entry extraction failed
+
+                video_url = entry.get('url', '')
+                title = entry.get('title', 'No Title')
+
+                # Filter for Shorts based on URL containing '/shorts/'
+                if '/shorts/' in video_url:
+                    video_id = self.get_video_id(video_url)
+                    if not video_id:
+                        logger.warning(f"Could not extract video ID from URL: {video_url}")
+                        continue
+
+                    full_url = f"https://www.youtube.com/watch?v={video_id}"
+                    video_data = {
+                        'title': title,
+                        'url': full_url,
+                        'thumbnail_url': self.get_thumbnail_url(full_url)
+                    }
+                    self.videoScraped.emit(video_data)
+                    logger.debug(f"Scraped Shorts video: {title} - {full_url}")
+
+        logger.info("Finished scraping all channels.")
+        self.done.emit()
+
+    def get_thumbnail_url(self, video_url):
+        """
+        Constructs the thumbnail URL based on the video ID extracted from the URL.
+        """
+        video_id = self.get_video_id(video_url)
+        if video_id:
+            return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        return ""
+
+    def get_video_id(self, video_url):
+        """
+        Extracts the video ID from the full video URL.
+        """
+        match = re.search(r"v=([^&?/]+)", video_url)
+        if match:
+            return match.group(1)
+        match = re.search(r"/shorts/([^?/]+)", video_url)
+        if match:
+            return match.group(1)
+        return ""
+
+    def stop(self):
+        """Stops the thread execution."""
+        self._is_running = False
 
 # --------------------------------------------------------------------------
 # MAIN
