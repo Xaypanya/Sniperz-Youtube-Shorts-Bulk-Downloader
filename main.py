@@ -61,26 +61,6 @@ logger = logging.getLogger("SniperzDownloader")
 logger.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs
 
 # --------------------------------------------------------------------------
-# CHANNELS - you can edit or expand this list
-# --------------------------------------------------------------------------
-ALL_CHANNELS = [
-    "https://www.youtube.com/@Allprocessofworld_shorts/shorts",
-    "https://www.youtube.com/@TechOnlineShow/shorts",
-    "https://www.youtube.com/@Craftsman_Vlog/shorts",
-    "https://www.youtube.com/@BestWorkingDay/shorts",
-    "https://www.youtube.com/@craftsmanclips/shorts",
-    "https://www.youtube.com/@SiragusaMatranga/shorts",
-    "https://www.youtube.com/@CraftsmanVision/shorts",
-    "https://www.youtube.com/@amazingskills012/shorts",
-    "https://www.youtube.com/@Amazing-Making-Process/shorts",
-    "https://www.youtube.com/@wisdompouchannel/shorts",
-    "https://www.youtube.com/@Deliciousfood-sr1di/shorts",
-    "https://www.youtube.com/@theworldspins/shorts",
-    "https://www.youtube.com/@CraftsmanWhale/shorts",
-    "https://www.youtube.com/@hardworkingday/shorts",
-]
-
-# --------------------------------------------------------------------------
 # SCRAPE WORKER (YT-DLP)
 # --------------------------------------------------------------------------
 class ScrapeWorker(QThread):
@@ -294,15 +274,17 @@ class ThumbnailLoader(QThread):
                     logger.debug(f"Thumbnail loaded for row {self.row}.")
                 else:
                     logger.warning(f"Failed to load pixmap from data: {self.thumb_url}")
-            else:
-                logger.warning(
-                    f"Thumbnail request failed (status={resp.status_code}): {self.thumb_url}"
-                )
         except Exception as e:
             logger.warning(f"Could not load thumbnail: {self.thumb_url}. Error: {e}")
 
-        self.thumbnailLoaded.emit(self.row, pixmap)
+        # Ensure pixmap is always a QPixmap object
+        if pixmap is None or pixmap.isNull():
+            # Create a default pixmap (e.g., a gray rectangle)
+            pixmap = QPixmap(80, 60)
+            pixmap.fill(Qt.GlobalColor.gray)
+            logger.debug(f"Emitting default pixmap for row {self.row}.")
 
+        self.thumbnailLoaded.emit(self.row, pixmap)
 # --------------------------------------------------------------------------
 # MAIN WINDOW
 # --------------------------------------------------------------------------
@@ -334,14 +316,12 @@ class MainWindow(QMainWindow):
         menubar.addMenu(channel_menu)
         self.setMenuBar(menubar)
 
-        # Top row (1): channel selection + scrape + cancel scrape
+        # Top row: enter channel URLs + scrape + cancel scrape
         top_layout = QHBoxLayout()
-        label = QLabel("Select channel:")
-        self.channel_combo = QComboBox()
-        self.channel_combo.addItem("All Channels")
-        for c in ALL_CHANNELS:
-            self.channel_combo.addItem(c)
-        self.channel_combo.setFixedHeight(40)  # Increased height
+        label = QLabel("Enter YouTube Channels Shorts URLs (one per line):")
+        self.channel_input = QPlainTextEdit()
+        self.channel_input.setPlaceholderText("https://www.youtube.com/@ChannelName/shorts")
+        self.channel_input.setFixedHeight(80)  # Increased height
 
         self.scrape_button = QPushButton("Scrape")
         self.scrape_button.clicked.connect(self.handle_scrape)
@@ -376,13 +356,13 @@ class MainWindow(QMainWindow):
         """)
         self.cancel_scrape_button.setEnabled(False)  # Initially disabled
 
-        # top_layout => channel label, combo, Scrape, Cancel Scrape
+        # top_layout => label, channel_input, Scrape, Cancel Scrape
         top_layout.addWidget(label)
-        top_layout.addWidget(self.channel_combo)
+        top_layout.addWidget(self.channel_input)
         top_layout.addWidget(self.scrape_button)
         top_layout.addWidget(self.cancel_scrape_button)
 
-        # Top row (2): download folder + browse button
+        # Second row: download folder + browse button
         folder_layout = QHBoxLayout()
         folder_label = QLabel("Download Folder:")
         self.folder_edit = QLineEdit()
@@ -408,7 +388,7 @@ class MainWindow(QMainWindow):
         folder_layout.addWidget(self.folder_edit)
         folder_layout.addWidget(self.browse_button)
 
-        # Row for Export CSV, Download Videos, Cancel Download
+        # Third row: Export CSV, Download Videos, Cancel Download
         action_layout = QHBoxLayout()
         self.export_button = QPushButton("Export CSV")
         self.export_button.clicked.connect(self.export_csv)
@@ -600,15 +580,10 @@ class MainWindow(QMainWindow):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     lines = f.read().splitlines()
 
-                # Clear existing combo items except 'All Channels'
-                all_text = self.channel_combo.itemText(0)
-                self.channel_combo.clear()
-                self.channel_combo.addItem(all_text)
-                for line in lines:
-                    line = line.strip()
-                    if line:
-                        self.channel_combo.addItem(line)
-
+                # Append loaded channels to the input field
+                existing_text = self.channel_input.toPlainText()
+                new_text = existing_text + '\n' + '\n'.join([line.strip() for line in lines if line.strip()])
+                self.channel_input.setPlainText(new_text)
                 logger.info(f"Loaded {len(lines)} channel URLs from file: {file_path}")
             except Exception as e:
                 logger.error(f"Error loading channels from file: {e}")
@@ -619,12 +594,37 @@ class MainWindow(QMainWindow):
     def handle_scrape(self):
         logger.info("Scrape button clicked. Starting scrape process...")
 
+        # Retrieve channel URLs from input field
+        input_text = self.channel_input.toPlainText()
+        channels = [line.strip() for line in input_text.splitlines() if line.strip()]
+
+        if not channels:
+            logger.warning("No channel URLs provided for scraping.")
+            return
+
+        # Validate channel URLs
+        valid_channels = []
+        invalid_channels = []
+        for url in channels:
+            if self.validate_channel_url(url):
+                valid_channels.append(url)
+            else:
+                invalid_channels.append(url)
+
+        if invalid_channels:
+            logger.warning(f"The following URLs are invalid and will be skipped:\n" + "\n".join(invalid_channels))
+
+        if not valid_channels:
+            logger.warning("No valid channel URLs to scrape.")
+            return
+
+        logger.info(f"Total valid channels to scrape: {len(valid_channels)}")
+
         # Disable buttons to prevent multiple operations
         self.scrape_button.setEnabled(False)
         self.download_button.setEnabled(False)
         self.export_button.setEnabled(False)
         self.browse_button.setEnabled(False)
-        self.channel_combo.setEnabled(False)
         self.cancel_scrape_button.setEnabled(True)  # Enable Cancel Scrape button
 
         # Change button text to indicate scraping
@@ -637,16 +637,10 @@ class MainWindow(QMainWindow):
         self.scraped_data = []
         self.current_row = 0
 
-        selected = self.channel_combo.currentText()
-        if selected == "All Channels":
-            channels_to_scrape = ALL_CHANNELS
-        else:
-            channels_to_scrape = [selected]
-
-        logger.info(f"Channels to scrape: {channels_to_scrape}")
+        logger.info(f"Channels to scrape: {valid_channels}")
 
         # Initialize ScrapeWorker with headless=True
-        self.scrape_worker = ScrapeWorker(channels_to_scrape, headless=True)
+        self.scrape_worker = ScrapeWorker(valid_channels, headless=True)
         self.scrape_worker.videoScraped.connect(self.add_video_to_table)
         self.scrape_worker.progressUpdated.connect(self.update_progress)
         self.scrape_worker.done.connect(self.scrape_finished)
@@ -657,10 +651,18 @@ class MainWindow(QMainWindow):
         logger.info("Scraping completed.")
         self.scrape_button.setEnabled(True)
         self.browse_button.setEnabled(True)
-        self.channel_combo.setEnabled(True)
+        self.channel_input.setEnabled(True)
         self.scrape_button.setText("Scrape")
         self.cancel_scrape_button.setEnabled(False)  # Disable Cancel Scrape button
         logger.info("Ready for next operation.")
+
+    def validate_channel_url(self, url):
+        """
+        Validates if the provided URL is a YouTube Shorts channel URL.
+        Expected format: https://www.youtube.com/@ChannelName/shorts
+        """
+        pattern = r"^https?://www\.youtube\.com/@[^/]+/shorts/?$"
+        return re.match(pattern, url) is not None
 
     # ---------------------------------------------------------
     # CANCEL SCRAPE
@@ -821,7 +823,6 @@ class MainWindow(QMainWindow):
         self.scrape_button.setEnabled(False)
         self.export_button.setEnabled(False)
         self.browse_button.setEnabled(False)
-        self.channel_combo.setEnabled(False)
         self.cancel_download_button.setEnabled(True)  # Enable Cancel Download button
 
         # Change button text to indicate downloading
@@ -842,9 +843,8 @@ class MainWindow(QMainWindow):
         self.scrape_button.setEnabled(True)
         self.export_button.setEnabled(len(self.scraped_data) > 0)
         self.browse_button.setEnabled(True)
-        self.channel_combo.setEnabled(True)
-        self.download_button.setText("Download Videos")
         self.cancel_download_button.setEnabled(False)  # Disable Cancel Download button
+        self.download_button.setText("Download Videos")
         logger.info("Ready for next operation.")
 
     # ---------------------------------------------------------
